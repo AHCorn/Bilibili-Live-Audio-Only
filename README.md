@@ -22,7 +22,7 @@
 
 | 音频模式 关 | 音频模式 开 |
 |:---:|:---:|
-| ![普通模式](assets/player-audio-off.png) | ![音频模式](assets/player-audio-on.png) |
+| ![普通模式](screenshots/player-audio-off.png) | ![音频模式](screenshots/player-audio-on.png) |
 
 *示例：某官方赛事直播间*
 
