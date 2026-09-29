@@ -204,12 +204,26 @@
 
     // only_audio=1 只在 http_stream(FLV) 上真实生效，HLS 分片仍含视频轨，
     // 因此把候选流过滤到仅剩 FLV，防止播放器选中 HLS 导致白省
+    // audioAvailable：null=还没取到流列表，true=有 FLV 可屏蔽视频，false=本房间做不到
+    var audioAvailable = null;
+
     function filterFlvOnly(data) {
         try {
             var playurl = data && data.data && data.data.playurl_info && data.data.playurl_info.playurl;
             if (!playurl || !playurl.stream) return data;
             var flvOnly = playurl.stream.filter(function (s) { return s.protocol_name === "http_stream"; });
-            if (flvOnly.length) playurl.stream = flvOnly;
+            if (flvOnly.length) {
+                playurl.stream = flvOnly;
+                audioAvailable = true;
+            } else if (playurl.stream.length) {
+                // 有流但一条 FLV 都没有：纯 HLS 房间，保持原列表正常播放
+                audioAvailable = false;
+                logDebug("无 FLV 线路，音频模式不可用", { protocols: playurl.stream.map(function (s) { return s.protocol_name; }).join(",") });
+                refreshButton();
+                // 提示可能已经按"音频模式"挂上了：移除让常驻观察器按新状态补挂
+                var mounted = document.getElementById(OVERLAY_ID);
+                if (mounted) mounted.remove();
+            }
         } catch (e) {}
         return data;
     }
@@ -257,7 +271,10 @@
                     }
                 }
             }
-            if (flv.length) playurl.stream = flv;
+            if (flv.length) {
+                playurl.stream = flv;
+                audioAvailable = true;
+            }
         } catch (e) {}
         return data;
     }
@@ -567,24 +584,28 @@
         var media = playerEl.querySelector("video, audio");
         if (!media) return;
 
+        var unsupported = audioAvailable === false;
         var overlay = document.createElement("div");
         overlay.id = OVERLAY_ID;
-        overlay.innerHTML =
-            '<div class="blao-bars" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>' +
-            '<div class="blao-title">音频模式</div>' +
-            '<div class="blao-sub">视频流已屏蔽，正在播放声音' +
-            (streamMode === "app" ? " · App 接口" : "") + "</div>";
+        overlay.innerHTML = unsupported
+            ? '<div class="blao-title">本房间无法仅播音频</div>' +
+              '<div class="blao-sub">这条直播只有 HLS 线路，HLS 分片仍带视频轨，已保持正常播放</div>'
+            : '<div class="blao-bars" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>' +
+              '<div class="blao-title">音频模式</div>' +
+              '<div class="blao-sub">视频流已屏蔽，正在播放声音' +
+              (streamMode === "app" ? " · App 接口" : "") + "</div>";
         playerEl.appendChild(overlay);
 
         // 媒体实际带视频轨时（only_audio 失效退化、轮播播片）提示与事实不符，
         // 隐藏而非移除——移除会被常驻观察器重复补挂；播放器重建时随子树一起销毁
+        // 例外：不支持提示解释的正是"为什么没省流量"，画面在也要留着
         var loggedTrack = false;
         function checkTrack() {
             if (!loggedTrack && media.readyState >= 1) {
                 loggedTrack = true;
                 logDebug("媒体轨", snapshotMedia());
             }
-            overlay.style.display = media.videoWidth > 0 ? "none" : "";
+            overlay.style.display = unsupported || media.videoWidth === 0 ? "" : "none";
         }
         media.addEventListener("loadedmetadata", checkTrack);
         media.addEventListener("resize", checkTrack);
@@ -664,12 +685,30 @@
             "#" + BUTTON_ID + ":hover{background:rgba(28,31,37,.95);border-color:rgba(255,255,255,.22)}",
             "#" + BUTTON_ID + ":focus-visible{outline:2px solid rgba(120,170,255,.9);outline-offset:2px}",
             "#" + BUTTON_ID + " .blao-dot{width:6px;height:6px;border-radius:50%;background:#8a8f98}",
-            "#" + BUTTON_ID + ".blao-on .blao-dot{background:#3fb960}"
+            "#" + BUTTON_ID + ".blao-on .blao-dot{background:#3fb960}",
+            "#" + BUTTON_ID + ".blao-na .blao-dot{background:#e6a23c}"
         ].join("");
 
         var style = document.createElement("style");
         style.textContent = css;
         document.head.appendChild(style);
+    }
+
+    function buttonLabel() {
+        if (audioAvailable === false) return "音频模式 不可用";
+        return enabled ? "音频模式 开" : "音频模式 关";
+    }
+
+    // 取流结果可能晚于按钮挂载，这里允许流列表确定后回写一次状态
+    function refreshButton() {
+        var btn = document.getElementById(BUTTON_ID);
+        if (!btn) return;
+        var label = btn.querySelector("span:last-child");
+        if (label) label.textContent = buttonLabel();
+        btn.classList.toggle("blao-na", audioAvailable === false);
+        btn.title = audioAvailable === false
+            ? "本房间只有 HLS 线路，而 HLS 分片仍含视频轨，无法只播音频"
+            : "屏蔽视频流、只播音频以节省流量；点击切换后自动刷新页面";
     }
 
     function mountButton() {
@@ -685,7 +724,7 @@
         var dot = document.createElement("span");
         dot.className = "blao-dot";
         var label = document.createElement("span");
-        label.textContent = enabled ? "音频模式 开" : "音频模式 关";
+        label.textContent = buttonLabel();
         btn.appendChild(dot);
         btn.appendChild(label);
 
