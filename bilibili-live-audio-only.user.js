@@ -1078,7 +1078,7 @@
     }
 
     function readoutLines() {
-        var state = streamBypassedHooks() ? "取流不走页面请求，数不到"
+        var state = streamBypassedHooks() ? "取流未走页面请求"
             : !enabled ? "普通播放"
             : traffic.kind === "audio" ? "纯音频"
             : traffic.kind === "video" ? "仍在拉视频"
@@ -1087,36 +1087,42 @@
                 fmtRate(traffic.rate) + " · 本次 " + fmtTotal(traffic.bytes)];
     }
 
-    // 首选礼物栏左半段：那一行右侧是礼物图标、左侧到展开箭头之间是空的（实测图标
-    // 从 x=154 开始，行高 84px，正好放两行小字）。全屏时礼物栏不渲染，退回画面左下角。
-    // 两处都是绝对定位，不参与宿主容器的 flex 布局，因此不会挤压任何原生元素。
+    // 挂进礼物栏左侧那一格（.out-part）里当兄弟节点，跟着红包/天选一起排队，
+    // 是占位的、不是悬浮的——那格子随时会长出活动入口，浮在上面必然压到。
+    // 礼物图标面板是右对齐的绝对定位，所以左侧变宽不会挤到它。
+    // 全屏时礼物栏不渲染，退回画面左下角（那里才是绝对定位）。
     function readoutHost() {
         var fs = document.fullscreenElement;
         var player = document.querySelector("#live-player") || document.querySelector(".live-player-mounter");
         if (player && fs && fs !== player && !fs.contains(player)) player = null;
-        var gift = fs ? null : document.querySelector(".gift-control-section");
-        if (gift) return { el: gift, corner: false };
+        if (!fs) {
+            var row = document.querySelector(".gift-control-section");
+            var slot = row && (row.querySelector(".out-part") || row.querySelector(".left-part-ctnr"));
+            if (slot) return { el: slot, corner: false };
+        }
         if (player) return { el: player, corner: true };
         return fs ? { el: fs, corner: true } : null;
     }
 
-    // 礼物栏宽度随播放器变化，读数跟着图标左边缘收，收不下就换行而不是盖住图标
-    function readoutWidth(row) {
-        var panel = row.querySelector(".gift-panel") || row.querySelector(".right-part");
+    // 右边收到礼物图标左边缘为止：宽度按自身左边缘量，所以无论左边长出红包还是
+    // 天选入口，最多是把字截断，不会盖到任何原生元素上
+    function readoutWidth(el) {
+        var panel = document.querySelector(".gift-control-section .gift-panel") ||
+            document.querySelector(".gift-control-section .right-part");
         if (!panel) return 320;
-        var gap = panel.getBoundingClientRect().left - row.getBoundingClientRect().left - 36;
+        var gap = panel.getBoundingClientRect().left - el.getBoundingClientRect().left - 10;
         return Math.max(96, Math.min(320, Math.round(gap)));
     }
 
     function injectReadoutStyle() {
         var css = [
-            "#" + READOUT_ID + "{position:absolute;left:28px;top:50%;transform:translateY(-50%);z-index:9999;box-sizing:border-box;",
-            "display:flex;flex-direction:column;align-items:flex-start;gap:1px;padding:3px 8px;border-radius:6px;",
+            "#" + READOUT_ID + "{float:left;position:relative;top:50%;transform:translateY(-50%);box-sizing:border-box;margin-left:10px;",
+            "display:flex;flex-direction:column;align-items:stretch;gap:1px;padding:3px 8px;border-radius:6px;",
             "background:rgba(18,20,24,.72);color:#dde1e6;font:12px/1.5 -apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif;",
-            "white-space:normal;pointer-events:none;user-select:none;font-variant-numeric:tabular-nums}",
-            "#" + READOUT_ID + ">span{max-width:100%;overflow:hidden;text-overflow:ellipsis}",
+            "white-space:nowrap;pointer-events:none;user-select:none;font-variant-numeric:tabular-nums}",
+            "#" + READOUT_ID + ">span{overflow:hidden;text-overflow:ellipsis}",
             "#" + READOUT_ID + ">span:first-child{font-weight:600}",
-            "#" + READOUT_ID + ".blao-corner{left:12px;top:auto;bottom:62px;transform:none;max-width:50%}",
+            "#" + READOUT_ID + ".blao-corner{float:none;margin-left:0;position:absolute;top:auto;bottom:62px;left:12px;transform:none;z-index:9999;max-width:50%}",
             "#" + READOUT_ID + ".blao-bad{color:#f0a020}"
         ].join("");
         var style = document.createElement("style");
@@ -1143,15 +1149,19 @@
             host.el.appendChild(readoutEl);
         }
         readoutEl.style.display = "";
-        readoutEl.classList.toggle("blao-corner", host.corner);
-        if (host.corner) {
-            readoutEl.style.maxWidth = "";
-        } else {
-            readoutEl.style.maxWidth = readoutWidth(host.el) + "px";
-        }
         var lines = readoutLines();
         readoutEl.children[0].textContent = lines[0];
         readoutEl.children[1].textContent = lines[1];
+        readoutEl.classList.toggle("blao-corner", host.corner);
+        readoutEl.style.maxWidth = "";
+        if (!host.corner) {
+            // 宽度按内容取，再被礼物图标的左边缘截断；不用 max-width 是因为
+            // 浮动元素的 shrink-to-fit 和 max-width 会互相绕，量出来的高度会不对
+            readoutEl.style.width = "max-content";
+            readoutEl.style.width = Math.min(readoutEl.offsetWidth, readoutWidth(readoutEl)) + "px";
+        } else {
+            readoutEl.style.width = "";
+        }
         var bypassed = streamBypassedHooks();
         if (bypassed && !traffic.bypassLogged) {
             traffic.bypassLogged = true;
