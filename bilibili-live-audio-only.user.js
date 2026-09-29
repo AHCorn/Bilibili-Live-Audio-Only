@@ -1073,19 +1073,19 @@
         return "音频模式 " + (enabled ? "开" : "关") + " · " + fmtRate(traffic.rate) + " · " + state + " · 本次 " + fmtTotal(traffic.bytes);
     }
 
-    // 首选顶部信息栏（热门榜右侧空位）；退回礼物栏左侧；进全屏时头部不渲染，改挂全屏元素内
+    // 挂画面区左下角（控制条上方那段空白）。绝对定位不参与父容器的 flex 布局，
+    // 因此不会挤压热门榜一类的原生元素；全屏时 #live-player 会整体放大，读数跟着走
     function readoutHost() {
+        var player = document.querySelector("#live-player") || document.querySelector(".live-player-mounter");
         var fs = document.fullscreenElement;
-        if (fs) return fs.querySelector("#live-player") || fs;
-        var rank = document.querySelector(".popular-rank-wrap");
-        if (rank && rank.closest && rank.closest(".info-section")) return rank.closest(".info-section");
-        var gift = document.querySelector(".gift-menu-root");
-        return gift && gift.parentElement ? gift.parentElement : null;
+        if (player && (!fs || fs === player || fs.contains(player))) return player;
+        return fs || null;
     }
 
     function injectReadoutStyle() {
         var css = [
-            "#" + READOUT_ID + "{display:inline-flex;align-items:center;gap:6px;padding:3px 8px;border-radius:6px;",
+            "#" + READOUT_ID + "{position:absolute;left:12px;bottom:62px;z-index:9999;",
+            "display:inline-flex;align-items:center;gap:6px;padding:3px 8px;border-radius:6px;",
             "background:rgba(18,20,24,.72);color:#dde1e6;font:12px/1.4 -apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif;",
             "white-space:nowrap;pointer-events:none;user-select:none;font-variant-numeric:tabular-nums}",
             "#" + READOUT_ID + ".blao-bad{color:#f0a020}"
