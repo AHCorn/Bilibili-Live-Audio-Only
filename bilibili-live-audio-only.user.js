@@ -970,6 +970,156 @@
         pageWindow.__biliLiveAudioOnlySettings = toggleSettingsPanel;
     }
 
+    // ---------- 实时流量读数 ----------
+
+    // 为什么自己数字节：resource timing 对 CDN 分片的 encodedBodySize 全是 0
+    // （服务端没给 Timing-Allow-Origin），performance 接口拿不到流量。
+    // 为什么不用 <video>.videoWidth 当判据：登录态下播放器把媒体元素放在 shadow root 里，
+    // 顶层文档 querySelector('video') 返回 null，只有 URL 上的线路标记是稳定可读的证据。
+    var READOUT_ID = "bili-audio-only-traffic";
+    var traffic = { bytes: 0, last: 0, rate: 0, kind: "", warned: false };
+
+    var MEDIA_EXT = [".flv", ".m3u8", ".ts", ".m4s"];
+
+    function isMediaUrl(u) {
+        var p = String(u).split("?")[0];
+        for (var i = 0; i < MEDIA_EXT.length; i++) { if (p.lastIndexOf(MEDIA_EXT[i]) > 0) return true; }
+        return p.indexOf("live-bvc") > 0;
+    }
+
+    // 实测：only_audio 只在 FLV 上给出纯音频，HLS 分片照旧含视频轨
+    function classifyMedia(u) {
+        var path = String(u).split("?")[0];
+        if (/\.flv$/.test(path)) return /[?&]ptype=1/.test(String(u)) ? "audio" : "video";
+        if (/\.(m4s|ts)$/.test(path) || /\.m3u8$/.test(path)) return "video";
+        return "";
+    }
+
+    function noteMediaBytes(u, n) {
+        if (!(n > 0)) return;
+        traffic.bytes += n;
+        var kind = classifyMedia(u);
+        if (kind) {
+            if (kind === "video" && enabled && !traffic.warned) {
+                traffic.warned = true;
+                logDebug("音频模式下仍在拉视频轨", { url: hostPath(String(u).slice(0, 160)) });
+            }
+            traffic.kind = kind;
+        }
+    }
+
+    function installTrafficHooks() {
+        var pageFetch = pageWindow.fetch;
+        pageWindow.fetch = function () {
+            var args = arguments;
+            var u = typeof args[0] === "string" ? args[0] : (args[0] && args[0].url) || "";
+            var pr = pageFetch.apply(this, args);
+            if (!isMediaUrl(u)) return pr;
+            return pr.then(function (res) {
+                try {
+                    if (!res.body || typeof res.body.getReader !== "function") return res;
+                    var rd = res.body.getReader();
+                    var wrapped = new ReadableStream({
+                        pull: function (c) {
+                            return rd.read().then(function (r) {
+                                if (r.done) { c.close(); return; }
+                                noteMediaBytes(u, r.value.byteLength);
+                                c.enqueue(r.value);
+                            });
+                        },
+                        cancel: function () { return rd.cancel(); }
+                    });
+                    return new Response(wrapped, { status: res.status, statusText: res.statusText, headers: res.headers });
+                } catch (e) { return res; }
+            });
+        };
+
+        var proto = pageWindow.XMLHttpRequest.prototype;
+        var rawOpen = proto.open, rawSend = proto.send;
+        proto.open = function (method, url) {
+            this.__blaoMedia = isMediaUrl(url) ? String(url) : null;
+            this.__blaoLoaded = 0;
+            return rawOpen.apply(this, arguments);
+        };
+        proto.send = function () {
+            var x = this;
+            if (x.__blaoMedia) {
+                // 用 progress 的 loaded 增量，避免反复读 responseText/response 复制整块缓冲
+                x.addEventListener("progress", function (e) {
+                    var loaded = e.loaded || 0;
+                    if (loaded > x.__blaoLoaded) {
+                        noteMediaBytes(x.__blaoMedia, loaded - x.__blaoLoaded);
+                        x.__blaoLoaded = loaded;
+                    }
+                });
+            }
+            return rawSend.apply(this, arguments);
+        };
+    }
+
+    function fmtRate(bps) {
+        return bps >= 1048576 ? (bps / 1048576).toFixed(1) + " MB/s" : Math.round(bps / 1024) + " KB/s";
+    }
+    function fmtTotal(b) {
+        if (b >= 1073741824) return (b / 1073741824).toFixed(2) + " GB";
+        if (b >= 1048576) return (b / 1048576).toFixed(1) + " MB";
+        return Math.round(b / 1024) + " KB";
+    }
+    function readoutText() {
+        var state = !enabled ? "普通播放"
+            : traffic.kind === "audio" ? "纯音频"
+            : traffic.kind === "video" ? "仍在拉视频"
+            : "等待取流";
+        return "音频模式 " + (enabled ? "开" : "关") + " · " + fmtRate(traffic.rate) + " · " + state + " · 本次 " + fmtTotal(traffic.bytes);
+    }
+
+    // 首选顶部信息栏（热门榜右侧空位）；退回礼物栏左侧；进全屏时头部不渲染，改挂全屏元素内
+    function readoutHost() {
+        var fs = document.fullscreenElement;
+        if (fs) return fs.querySelector("#live-player") || fs;
+        var rank = document.querySelector(".popular-rank-wrap");
+        if (rank && rank.closest && rank.closest(".info-section")) return rank.closest(".info-section");
+        var gift = document.querySelector(".gift-menu-root");
+        return gift && gift.parentElement ? gift.parentElement : null;
+    }
+
+    function injectReadoutStyle() {
+        var css = [
+            "#" + READOUT_ID + "{display:inline-flex;align-items:center;gap:6px;padding:3px 8px;border-radius:6px;",
+            "background:rgba(18,20,24,.72);color:#dde1e6;font:12px/1.4 -apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif;",
+            "white-space:nowrap;pointer-events:none;user-select:none;font-variant-numeric:tabular-nums}",
+            "#" + READOUT_ID + ".blao-bad{color:#f0a020}"
+        ].join("");
+        var style = document.createElement("style");
+        style.textContent = css;
+        document.head.appendChild(style);
+    }
+
+    var readoutEl = null;
+
+    function tickReadout() {
+        var delta = traffic.bytes - traffic.last;
+        traffic.last = traffic.bytes;
+        traffic.rate = delta ? (traffic.rate ? traffic.rate * 0.5 + delta * 0.5 : delta) : traffic.rate * 0.8;
+
+        var host = readoutHost();
+        if (!host) { if (readoutEl) readoutEl.style.display = "none"; return; }
+        if (!readoutEl || readoutEl.parentNode !== host) {
+            if (!readoutEl) { readoutEl = document.createElement("div"); readoutEl.id = READOUT_ID; }
+            host.appendChild(readoutEl);
+        }
+        readoutEl.style.display = "";
+        readoutEl.textContent = readoutText();
+        readoutEl.classList.toggle("blao-bad", !!enabled && traffic.kind === "video");
+    }
+
+    onReady(function () {
+        injectReadoutStyle();
+        try { installTrafficHooks(); } catch (e) { logDebug("流量钩子安装失败", String(e && e.message || e)); }
+        tickReadout();
+        setInterval(tickReadout, 1000);
+    });
+
     // 活动特殊页（独立播放器）没有 #live-player，按钮与提示层都不该出现；
     // 观察器常驻以便播放器重建后自动补挂提示层
     onReady(function () {
