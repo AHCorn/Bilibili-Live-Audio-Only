@@ -977,7 +977,7 @@
     // 为什么不用 <video>.videoWidth 当判据：登录态下播放器把媒体元素放在 shadow root 里，
     // 顶层文档 querySelector('video') 返回 null，只有 URL 上的线路标记是稳定可读的证据。
     var READOUT_ID = "bili-audio-only-traffic";
-    var traffic = { bytes: 0, last: 0, rate: 0, kind: "", warned: false };
+    var traffic = { bytes: 0, last: 0, rate: 0, kind: "", warned: false, bypassLogged: false };
 
     var MEDIA_EXT = [".flv", ".m3u8", ".ts", ".m4s"];
 
@@ -1065,29 +1065,58 @@
         if (b >= 1048576) return (b / 1048576).toFixed(1) + " MB";
         return Math.round(b / 1024) + " KB";
     }
-    function readoutText() {
-        var state = !enabled ? "普通播放"
+    // 数到 0 有两种可能：还没开始取流 / 取流绕过了页面的 fetch-XHR（worker、P2P）。
+    // resource timing 虽然给不出字节（没有 Timing-Allow-Origin），但条目本身还在，
+    // 用它区分这两种情况，别把"钩子没钩到"显示成"没花流量"
+    function streamBypassedHooks() {
+        if (traffic.bytes) return false;
+        try {
+            var e = performance.getEntriesByType("resource");
+            for (var i = 0; i < e.length; i++) { if (isMediaUrl(e[i].name)) return true; }
+        } catch (err) {}
+        return false;
+    }
+
+    function readoutLines() {
+        var state = streamBypassedHooks() ? "取流不走页面请求，数不到"
+            : !enabled ? "普通播放"
             : traffic.kind === "audio" ? "纯音频"
             : traffic.kind === "video" ? "仍在拉视频"
             : "等待取流";
-        return "音频模式 " + (enabled ? "开" : "关") + " · " + fmtRate(traffic.rate) + " · " + state + " · 本次 " + fmtTotal(traffic.bytes);
+        return ["音频模式 " + (enabled ? "开" : "关") + " · " + state,
+                fmtRate(traffic.rate) + " · 本次 " + fmtTotal(traffic.bytes)];
     }
 
-    // 挂画面区左下角（控制条上方那段空白）。绝对定位不参与父容器的 flex 布局，
-    // 因此不会挤压热门榜一类的原生元素；全屏时 #live-player 会整体放大，读数跟着走
+    // 首选礼物栏左半段：那一行右侧是礼物图标、左侧到展开箭头之间是空的（实测图标
+    // 从 x=154 开始，行高 84px，正好放两行小字）。全屏时礼物栏不渲染，退回画面左下角。
+    // 两处都是绝对定位，不参与宿主容器的 flex 布局，因此不会挤压任何原生元素。
     function readoutHost() {
-        var player = document.querySelector("#live-player") || document.querySelector(".live-player-mounter");
         var fs = document.fullscreenElement;
-        if (player && (!fs || fs === player || fs.contains(player))) return player;
-        return fs || null;
+        var player = document.querySelector("#live-player") || document.querySelector(".live-player-mounter");
+        if (player && fs && fs !== player && !fs.contains(player)) player = null;
+        var gift = fs ? null : document.querySelector(".gift-control-section");
+        if (gift) return { el: gift, corner: false };
+        if (player) return { el: player, corner: true };
+        return fs ? { el: fs, corner: true } : null;
+    }
+
+    // 礼物栏宽度随播放器变化，读数跟着图标左边缘收，收不下就换行而不是盖住图标
+    function readoutWidth(row) {
+        var panel = row.querySelector(".gift-panel") || row.querySelector(".right-part");
+        if (!panel) return 320;
+        var gap = panel.getBoundingClientRect().left - row.getBoundingClientRect().left - 36;
+        return Math.max(96, Math.min(320, Math.round(gap)));
     }
 
     function injectReadoutStyle() {
         var css = [
-            "#" + READOUT_ID + "{position:absolute;left:12px;bottom:62px;z-index:9999;",
-            "display:inline-flex;align-items:center;gap:6px;padding:3px 8px;border-radius:6px;",
-            "background:rgba(18,20,24,.72);color:#dde1e6;font:12px/1.4 -apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif;",
-            "white-space:nowrap;pointer-events:none;user-select:none;font-variant-numeric:tabular-nums}",
+            "#" + READOUT_ID + "{position:absolute;left:28px;top:50%;transform:translateY(-50%);z-index:9999;box-sizing:border-box;",
+            "display:flex;flex-direction:column;align-items:flex-start;gap:1px;padding:3px 8px;border-radius:6px;",
+            "background:rgba(18,20,24,.72);color:#dde1e6;font:12px/1.5 -apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif;",
+            "white-space:normal;pointer-events:none;user-select:none;font-variant-numeric:tabular-nums}",
+            "#" + READOUT_ID + ">span{max-width:100%;overflow:hidden;text-overflow:ellipsis}",
+            "#" + READOUT_ID + ">span:first-child{font-weight:600}",
+            "#" + READOUT_ID + ".blao-corner{left:12px;top:auto;bottom:62px;transform:none;max-width:50%}",
             "#" + READOUT_ID + ".blao-bad{color:#f0a020}"
         ].join("");
         var style = document.createElement("style");
@@ -1104,18 +1133,40 @@
 
         var host = readoutHost();
         if (!host) { if (readoutEl) readoutEl.style.display = "none"; return; }
-        if (!readoutEl || readoutEl.parentNode !== host) {
-            if (!readoutEl) { readoutEl = document.createElement("div"); readoutEl.id = READOUT_ID; }
-            host.appendChild(readoutEl);
+        if (!readoutEl || readoutEl.parentNode !== host.el) {
+            if (!readoutEl) {
+                readoutEl = document.createElement("div");
+                readoutEl.id = READOUT_ID;
+                readoutEl.appendChild(document.createElement("span"));
+                readoutEl.appendChild(document.createElement("span"));
+            }
+            host.el.appendChild(readoutEl);
         }
         readoutEl.style.display = "";
-        readoutEl.textContent = readoutText();
-        readoutEl.classList.toggle("blao-bad", !!enabled && traffic.kind === "video");
+        readoutEl.classList.toggle("blao-corner", host.corner);
+        if (host.corner) {
+            readoutEl.style.maxWidth = "";
+        } else {
+            readoutEl.style.maxWidth = readoutWidth(host.el) + "px";
+        }
+        var lines = readoutLines();
+        readoutEl.children[0].textContent = lines[0];
+        readoutEl.children[1].textContent = lines[1];
+        var bypassed = streamBypassedHooks();
+        if (bypassed && !traffic.bypassLogged) {
+            traffic.bypassLogged = true;
+            logDebug("有取流请求但一个字节都没数到：加载器可能在 worker 里或用 fetch/XHR 之外的通道", { entries: performance.getEntriesByType("resource").length });
+        }
+        readoutEl.classList.toggle("blao-bad", bypassed || (!!enabled && traffic.kind === "video"));
     }
+
+    // 必须装在 document-start、且早于播放器 bundle：bundle 初始化时就把 fetch 引用捕获了
+    // （B 站自己的性能日志里 playerScriptLoaded 只有十几毫秒），等 DOMContentLoaded 再装
+    // 已经晚了——实测那时画面照常出帧，钩子却一个字节都收不到
+    try { installTrafficHooks(); } catch (e) { logDebug("流量钩子安装失败", String(e && e.message || e)); }
 
     onReady(function () {
         injectReadoutStyle();
-        try { installTrafficHooks(); } catch (e) { logDebug("流量钩子安装失败", String(e && e.message || e)); }
         tickReadout();
         setInterval(tickReadout, 1000);
     });
