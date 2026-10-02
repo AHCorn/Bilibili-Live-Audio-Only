@@ -1009,6 +1009,217 @@
         pageWindow.__biliLiveAudioOnlySettings = toggleSettingsPanel;
     }
 
+    // ---------- 实时流量读数 ----------
+
+    // 为什么自己数字节：resource timing 对 CDN 分片的 encodedBodySize 全是 0
+    // （服务端没给 Timing-Allow-Origin），performance 接口拿不到流量。
+    // 为什么不用 <video>.videoWidth 当判据：登录态下播放器把媒体元素放在 shadow root 里，
+    // 顶层文档 querySelector('video') 返回 null，只有 URL 上的线路标记是稳定可读的证据。
+    var READOUT_ID = "bili-audio-only-traffic";
+    var traffic = { bytes: 0, last: 0, rate: 0, kind: "", warned: false, bypassLogged: false };
+
+    var MEDIA_EXT = [".flv", ".m3u8", ".ts", ".m4s"];
+
+    function isMediaUrl(u) {
+        var p = String(u).split("?")[0];
+        for (var i = 0; i < MEDIA_EXT.length; i++) { if (p.lastIndexOf(MEDIA_EXT[i]) > 0) return true; }
+        return p.indexOf("live-bvc") > 0;
+    }
+
+    // 实测：only_audio 只在 FLV 上给出纯音频，HLS 分片照旧含视频轨
+    function classifyMedia(u) {
+        var path = String(u).split("?")[0];
+        if (/\.flv$/.test(path)) return /[?&]ptype=1/.test(String(u)) ? "audio" : "video";
+        if (/\.(m4s|ts)$/.test(path) || /\.m3u8$/.test(path)) return "video";
+        return "";
+    }
+
+    function noteMediaBytes(u, n) {
+        if (!(n > 0)) return;
+        traffic.bytes += n;
+        var kind = classifyMedia(u);
+        if (kind) {
+            if (kind === "video" && enabled && !traffic.warned) {
+                traffic.warned = true;
+                logDebug("音频模式下仍在拉视频轨", { url: hostPath(String(u).slice(0, 160)) });
+            }
+            traffic.kind = kind;
+        }
+    }
+
+    function installTrafficHooks() {
+        var pageFetch = pageWindow.fetch;
+        pageWindow.fetch = function () {
+            var args = arguments;
+            var u = typeof args[0] === "string" ? args[0] : (args[0] && args[0].url) || "";
+            var pr = pageFetch.apply(this, args);
+            if (!isMediaUrl(u)) return pr;
+            return pr.then(function (res) {
+                try {
+                    if (!res.body || typeof res.body.getReader !== "function") return res;
+                    var rd = res.body.getReader();
+                    var wrapped = new ReadableStream({
+                        pull: function (c) {
+                            return rd.read().then(function (r) {
+                                if (r.done) { c.close(); return; }
+                                noteMediaBytes(u, r.value.byteLength);
+                                c.enqueue(r.value);
+                            });
+                        },
+                        cancel: function () { return rd.cancel(); }
+                    });
+                    return new Response(wrapped, { status: res.status, statusText: res.statusText, headers: res.headers });
+                } catch (e) { return res; }
+            });
+        };
+
+        var proto = pageWindow.XMLHttpRequest.prototype;
+        var rawOpen = proto.open, rawSend = proto.send;
+        proto.open = function (method, url) {
+            this.__blaoMedia = isMediaUrl(url) ? String(url) : null;
+            this.__blaoLoaded = 0;
+            return rawOpen.apply(this, arguments);
+        };
+        proto.send = function () {
+            var x = this;
+            if (x.__blaoMedia) {
+                // 用 progress 的 loaded 增量，避免反复读 responseText/response 复制整块缓冲
+                x.addEventListener("progress", function (e) {
+                    var loaded = e.loaded || 0;
+                    if (loaded > x.__blaoLoaded) {
+                        noteMediaBytes(x.__blaoMedia, loaded - x.__blaoLoaded);
+                        x.__blaoLoaded = loaded;
+                    }
+                });
+            }
+            return rawSend.apply(this, arguments);
+        };
+    }
+
+    function fmtRate(bps) {
+        return bps >= 1048576 ? (bps / 1048576).toFixed(1) + " MB/s" : Math.round(bps / 1024) + " KB/s";
+    }
+    function fmtTotal(b) {
+        if (b >= 1073741824) return (b / 1073741824).toFixed(2) + " GB";
+        if (b >= 1048576) return (b / 1048576).toFixed(1) + " MB";
+        return Math.round(b / 1024) + " KB";
+    }
+    // 数到 0 有两种可能：还没开始取流 / 取流绕过了页面的 fetch-XHR（worker、P2P）。
+    // resource timing 虽然给不出字节（没有 Timing-Allow-Origin），但条目本身还在，
+    // 用它区分这两种情况，别把"钩子没钩到"显示成"没花流量"
+    function streamBypassedHooks() {
+        if (traffic.bytes) return false;
+        try {
+            var e = performance.getEntriesByType("resource");
+            for (var i = 0; i < e.length; i++) { if (isMediaUrl(e[i].name)) return true; }
+        } catch (err) {}
+        return false;
+    }
+
+    function readoutLines() {
+        var state = streamBypassedHooks() ? "取流未走页面请求"
+            : !enabled ? "普通播放"
+            : traffic.kind === "audio" ? "纯音频"
+            : traffic.kind === "video" ? "仍在拉视频"
+            : "等待取流";
+        return ["音频模式 " + (enabled ? "开" : "关") + " · " + state,
+                fmtRate(traffic.rate) + " · 本次 " + fmtTotal(traffic.bytes)];
+    }
+
+    // 挂进礼物栏左侧那一格（.out-part）里当兄弟节点，跟着红包/天选一起排队，
+    // 是占位的、不是悬浮的——那格子随时会长出活动入口，浮在上面必然压到。
+    // 礼物图标面板是右对齐的绝对定位，所以左侧变宽不会挤到它。
+    // 全屏时礼物栏不渲染，退回画面左下角（那里才是绝对定位）。
+    function readoutHost() {
+        var fs = document.fullscreenElement;
+        var player = document.querySelector("#live-player") || document.querySelector(".live-player-mounter");
+        if (player && fs && fs !== player && !fs.contains(player)) player = null;
+        if (!fs) {
+            var row = document.querySelector(".gift-control-section");
+            var slot = row && (row.querySelector(".out-part") || row.querySelector(".left-part-ctnr"));
+            if (slot) return { el: slot, corner: false };
+        }
+        if (player) return { el: player, corner: true };
+        return fs ? { el: fs, corner: true } : null;
+    }
+
+    // 右边收到礼物图标左边缘为止：宽度按自身左边缘量，所以无论左边长出红包还是
+    // 天选入口，最多是把字截断，不会盖到任何原生元素上
+    function readoutWidth(el) {
+        var panel = document.querySelector(".gift-control-section .gift-panel") ||
+            document.querySelector(".gift-control-section .right-part");
+        if (!panel) return 320;
+        var gap = panel.getBoundingClientRect().left - el.getBoundingClientRect().left - 10;
+        return Math.max(96, Math.min(320, Math.round(gap)));
+    }
+
+    function injectReadoutStyle() {
+        var css = [
+            "#" + READOUT_ID + "{float:left;position:relative;top:50%;transform:translateY(-50%);box-sizing:border-box;margin-left:10px;",
+            "display:flex;flex-direction:column;align-items:stretch;gap:1px;padding:3px 8px;border-radius:6px;",
+            "background:rgba(18,20,24,.72);color:#dde1e6;font:12px/1.5 -apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei',sans-serif;",
+            "white-space:nowrap;pointer-events:none;user-select:none;font-variant-numeric:tabular-nums}",
+            "#" + READOUT_ID + ">span{overflow:hidden;text-overflow:ellipsis}",
+            "#" + READOUT_ID + ">span:first-child{font-weight:600}",
+            "#" + READOUT_ID + ".blao-corner{float:none;margin-left:0;position:absolute;top:auto;bottom:62px;left:12px;transform:none;z-index:9999;max-width:50%}",
+            "#" + READOUT_ID + ".blao-bad{color:#f0a020}"
+        ].join("");
+        var style = document.createElement("style");
+        style.textContent = css;
+        document.head.appendChild(style);
+    }
+
+    var readoutEl = null;
+
+    function tickReadout() {
+        var delta = traffic.bytes - traffic.last;
+        traffic.last = traffic.bytes;
+        traffic.rate = delta ? (traffic.rate ? traffic.rate * 0.5 + delta * 0.5 : delta) : traffic.rate * 0.8;
+
+        var host = readoutHost();
+        if (!host) { if (readoutEl) readoutEl.style.display = "none"; return; }
+        if (!readoutEl || readoutEl.parentNode !== host.el) {
+            if (!readoutEl) {
+                readoutEl = document.createElement("div");
+                readoutEl.id = READOUT_ID;
+                readoutEl.appendChild(document.createElement("span"));
+                readoutEl.appendChild(document.createElement("span"));
+            }
+            host.el.appendChild(readoutEl);
+        }
+        readoutEl.style.display = "";
+        var lines = readoutLines();
+        readoutEl.children[0].textContent = lines[0];
+        readoutEl.children[1].textContent = lines[1];
+        readoutEl.classList.toggle("blao-corner", host.corner);
+        readoutEl.style.maxWidth = "";
+        if (!host.corner) {
+            // 宽度按内容取，再被礼物图标的左边缘截断；不用 max-width 是因为
+            // 浮动元素的 shrink-to-fit 和 max-width 会互相绕，量出来的高度会不对
+            readoutEl.style.width = "max-content";
+            readoutEl.style.width = Math.min(readoutEl.offsetWidth, readoutWidth(readoutEl)) + "px";
+        } else {
+            readoutEl.style.width = "";
+        }
+        var bypassed = streamBypassedHooks();
+        if (bypassed && !traffic.bypassLogged) {
+            traffic.bypassLogged = true;
+            logDebug("有取流请求但一个字节都没数到：加载器可能在 worker 里或用 fetch/XHR 之外的通道", { entries: performance.getEntriesByType("resource").length });
+        }
+        readoutEl.classList.toggle("blao-bad", bypassed || (!!enabled && traffic.kind === "video"));
+    }
+
+    // 必须装在 document-start、且早于播放器 bundle：bundle 初始化时就把 fetch 引用捕获了
+    // （B 站自己的性能日志里 playerScriptLoaded 只有十几毫秒），等 DOMContentLoaded 再装
+    // 已经晚了——实测那时画面照常出帧，钩子却一个字节都收不到
+    try { installTrafficHooks(); } catch (e) { logDebug("流量钩子安装失败", String(e && e.message || e)); }
+
+    onReady(function () {
+        injectReadoutStyle();
+        tickReadout();
+        setInterval(tickReadout, 1000);
+    });
+
     // 活动特殊页（独立播放器）没有 #live-player，按钮与提示层都不该出现；
     // 观察器常驻以便播放器重建后自动补挂提示层
     onReady(function () {
